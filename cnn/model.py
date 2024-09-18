@@ -5,8 +5,8 @@ from module import Linear, Conv2d, Sequential, Linear_, Conv2d_, BatchNorm2d, Ba
 class ResNet5(nn.Module):
     def __init__(self):
         super().__init__()
-        self.module_w_para = nn.Sequential(Sequential(Conv2d_(3, 8, (3, 3), (1, 1), 1, 1e-3)),
-                                           Sequential(Conv2d_(8, 16, (3, 3), (1, 1), 1, 1e-3)),
+        self.module_w_para = nn.Sequential(Sequential(Conv2d(3, 8, (3, 3), (1, 1), 1, 1e-3)),
+                                           Sequential(Conv2d(8, 16, (3, 3), (1, 1), 1, 1e-3)),
                                            Sequential(Conv2d(16, 32, (3, 3), (1, 1), 1, 1e-1)),
                                            Sequential(Conv2d(32, 32, (3, 3), (1, 1), 1, 1e-1)),
                                            Sequential(Linear(32 * 4 * 4, 10, 1e-1))
@@ -34,6 +34,10 @@ class ResNet5(nn.Module):
 
     def fetch_gradient(self):
         return [seq.fetch_gradient() for seq in self.module_w_para]
+
+    def set_sigma(self, new_sigma):
+        for seq in self.module_w_para:
+            seq.set_sigma(new_sigma)
 
 
 class VGG8(nn.Module):
@@ -74,6 +78,10 @@ class VGG8(nn.Module):
     def fetch_gradient(self):
         return [seq.fetch_gradient() for seq in self.module_w_para]
     
+    def set_sigma(self, new_sigma):
+        for seq in self.module_w_para:
+            seq.set_sigma(new_sigma)
+
 
 class ResNet5_w_BN(nn.Module):
     def __init__(self):
@@ -109,19 +117,23 @@ class ResNet5_w_BN(nn.Module):
             
     def fetch_gradient(self):
         return [seq.fetch_gradient() for seq in self.module_w_para]
-    
+
+    def set_sigma(self, new_sigma):
+        for seq in self.module_w_para:
+            seq.set_sigma(new_sigma) 
+
 
 class ResNet18(nn.Module):
     def __init__(self):
         super().__init__()
-        self.module_w_para = nn.Sequential(Sequential(Conv2d_(3, 64, (7, 7), (2, 2), 3, 1e-3)),
+        self.module_w_para = nn.Sequential(Sequential(Conv2d(3, 64, (7, 7), (2, 2), 3, 1e-3)),
                                            Sequential(BatchNorm2d(64, 1e-3),
                                                       nn.ReLU(inplace=True),
-                                                      nn.MaxPool2d(3, 2, 1)),
-                                           Sequential(BasicBlock(Conv2d_, 64, 64, (3,3), 1, 1e-3)),
-                                           Sequential(BasicBlock(Conv2d_, 64, 64, (3,3), 1, 1e-3)),
-                                           Sequential(BasicBlock(Conv2d_, 64, 128, (3,3), 2, 1e-3)),
-                                           Sequential(BasicBlock(Conv2d_, 128, 128, (3,3), 1, 1e-3)),
+                                                      nn.AvgPool2d(3, 2, 1)),
+                                           Sequential(BasicBlock(Conv2d, 64, 64, (3,3), 1, 1e-3)),
+                                           Sequential(BasicBlock(Conv2d, 64, 64, (3,3), 1, 1e-3)),
+                                           Sequential(BasicBlock(Conv2d, 64, 128, (3,3), 2, 1e-3)),
+                                           Sequential(BasicBlock(Conv2d, 128, 128, (3,3), 1, 1e-3)),
                                            Sequential(BasicBlock(Conv2d, 128, 256, (3,3), 2, 1e-3)),
                                            Sequential(BasicBlock(Conv2d, 256, 256, (3,3), 1, 1e-3)),
                                            Sequential(BasicBlock(Conv2d, 256, 512, (3,3), 2, 1e-3)),
@@ -156,13 +168,17 @@ class ResNet18(nn.Module):
     def fetch_gradient(self):
         return [seq.fetch_gradient() for seq in self.module_w_para]
 
+    def set_sigma(self, new_sigma):
+        for seq in self.module_w_para:
+            seq.set_sigma(new_sigma)
+
 
 class ResNet18_wo_BN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.module_w_para = nn.Sequential(Sequential(Conv2d_(3, 64, (7, 7), (2, 2), 3, 1e-3),
+        self.module_w_para = nn.Sequential(Sequential(Conv2d(3, 64, (7, 7), (2, 2), 3, 1e-3),
                                                       nn.ReLU(inplace=True),
-                                                      nn.MaxPool2d(3, 2, 1)),
+                                                      nn.AvgPool2d(3, 2, 1)),
                                            Sequential(BasicBlock_wo_BN(Conv2d, 64, 64, (3,3), 1, 1e-3)),
                                            Sequential(BasicBlock_wo_BN(Conv2d, 64, 64, (3,3), 1, 1e-3)),
                                            Sequential(BasicBlock_wo_BN(Conv2d, 64, 128, (3,3), 2, 1e-3)),
@@ -190,3 +206,6 @@ class ResNet18_wo_BN(nn.Module):
     def fetch_gradient(self):
         return [seq.fetch_gradient() for seq in self.module_w_para]
 
+    def set_sigma(self, new_sigma):
+        for seq in self.module_w_para:
+            seq.set_sigma(new_sigma)

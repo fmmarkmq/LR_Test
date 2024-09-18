@@ -20,19 +20,27 @@ class Linear(nn.Linear):
         self.log_noise_std = nn.Parameter(torch.full((out_features,), np.log(init_std), device=device))
         self.input_buf = None
         self.epsilon_buf = None
+        self.added_noise = False
         self.qmc_method = qmc_method
         if self.qmc_method == 'sobol':
             self.sobol_engine = SobolEngine(2 * out_features)
         elif self.qmc_method == 'halton':
             self.halton_engine = Halton(2 * out_features)
 
-    def forward(self, input, add_noise=False):
+    def forward(self, input, add_noise=False, epsilon_buf=None):
         """
         input: (bs, in_features)
         logit_output: (bs, out_features)
         """
         logit_output = super().forward(input)
         if add_noise:
+            if epsilon_buf is not None:
+                noise = epsilon_buf * torch.exp(self.log_noise_std[None,:])
+                self.input_buf = input
+                self.epsilon_buf = epsilon_buf
+                self.added_noise = True
+                return logit_output
+            
             bs, out_features = logit_output.shape
             epsilon = torch.zeros_like(logit_output, device=self.log_noise_std.device)
 
@@ -48,9 +56,10 @@ class Linear(nn.Linear):
                 epsilon[:bs//2] += torch.randn((bs//2, out_features), device=self.log_noise_std.device)
             epsilon[bs//2:] -= epsilon[:bs//2]
 
-            noise = epsilon * torch.exp(self.log_noise_std)
+            noise = epsilon * torch.exp(self.log_noise_std[None,:])
             self.input_buf = input
             self.epsilon_buf = epsilon
+            self.added_noise = True
             return logit_output + noise
         else:
             return logit_output
@@ -65,22 +74,32 @@ class Linear(nn.Linear):
 
         self.weight.grad = torch.einsum('ni,nj->ji', self.input_buf * loss, self.epsilon_buf) / (noise_std * batch_size)
         self.bias.grad = torch.einsum('ni,nj->j', loss, self.epsilon_buf) / (torch.exp(self.log_noise_std) * batch_size)
-        self.log_noise_std.grad = torch.einsum('ni,nj->j', loss, self.epsilon_buf ** 2 - 1) / batch_size
-        # self.log_noise_std.grad = None
+        # self.log_noise_std.grad = torch.einsum('ni,nj->j', loss, self.epsilon_buf ** 2 - 1) / batch_size
+        self.log_noise_std.grad = None
 
         self.input_buf = None
         self.epsilon_buf = None
+        self.added_noise = False
 
     def fetch_gradient(self):
         return self.weight.grad.detach().cpu()
+
+    def set_sigma(self, new_sigma):
+        assert new_sigma > 0
+        if isinstance(new_sigma, float) or isinstance(new_sigma, int):
+            self.log_noise_std.data = torch.log(torch.full_like(self.log_noise_std.data, new_sigma))
+        elif isinstance(new_sigma, Tensor):
+            assert new_sigma.shape == self.log_noise_std.data.shape
+            self.log_noise_std.data = torch.log(new_sigma)
 
 
 class Linear_(nn.Linear):
     def __init__(self, in_features, out_features, init_std, bias=True, device=None, dtype=None, qmc_method=None):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.log_noise_std = nn.Parameter(torch.full((out_features,), np.log(init_std), device=device))
-        self.epsilon_buf = None
+        self.epsilon_buf_w = None
         self.epsilon_buf_b = None
+        self.added_noise = False
         self.qmc_method = qmc_method
         if self.qmc_method == 'sobol':
             self.sobol_engine = SobolEngine(2 * (self.weight.data.numel()+self.bias.data.numel()))
@@ -111,37 +130,46 @@ class Linear_(nn.Linear):
 
             epsilon_w[bs // 2:] -= epsilon_w[:bs // 2]
             epsilon_b[bs // 2:] -= epsilon_b[:bs // 2]
-            self.epsilon_buf = epsilon_w
+            self.epsilon_buf_w = epsilon_w
             self.epsilon_buf_b = epsilon_b
             w += epsilon_w * torch.exp(self.log_noise_std[None, :, None])
             b += epsilon_b * torch.exp(self.log_noise_std[None, :])
 
             logit_output = torch.bmm(w,input[:,:,None]).squeeze(-1) + b
+            self.added_noise = True
         else:
             logit_output = super().forward(input)
         return logit_output
 
     def backward(self, loss):
         bs = loss.shape[0]
-        tmp = loss[:, None, None] * self.epsilon_buf
+        tmp = loss[:, None, None] * self.epsilon_buf_w
         self.weight.grad = torch.sum(tmp, 0) / (bs * torch.exp(self.log_noise_std[:, None]))
 
         tmp = loss[:, None] * self.epsilon_buf_b
         self.bias.grad = torch.sum(tmp, 0) / (bs * torch.exp(self.log_noise_std))
 
-        tmp = torch.sum((self.epsilon_buf ** 2) - 1, dim=2) + ((self.epsilon_buf_b ** 2) - 1)
-        self.log_noise_std.grad = torch.sum(tmp * loss[:, None], 0) / bs
-        # self.log_noise_std.grad = None
+        # tmp = torch.sum((self.epsilon_buf_w ** 2) - 1, dim=2) + ((self.epsilon_buf_b ** 2) - 1)
+        # self.log_noise_std.grad = torch.sum(tmp * loss[:, None], 0) / bs
+        self.log_noise_std.grad = None
 
-        self.epsilon_buf = None
+        self.epsilon_buf_w = None
         self.epsilon_buf_b = None
+        self.added_noise = False
     
     def fetch_gradient(self):
         return self.weight.grad.detach().cpu()
 
+    def set_sigma(self, new_sigma):
+        assert new_sigma > 0
+        if isinstance(new_sigma, float) or isinstance(new_sigma, int):
+            self.log_noise_std.data = torch.log(torch.full_like(self.log_noise_std.data, new_sigma))
+        elif isinstance(new_sigma, Tensor):
+            assert new_sigma.shape == self.log_noise_std.data.shape
+            self.log_noise_std.data = torch.log(new_sigma)
+
 
 class Conv2d(nn.Conv2d):
-
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, init_std,
                  bias=True, device=None, dtype=None, qmc_method=None):
         """
@@ -156,19 +184,27 @@ class Conv2d(nn.Conv2d):
         self.log_noise_std = nn.Parameter(torch.full((out_channels,), np.log(init_std), device=device))
         self.input_buf = None
         self.epsilon_buf = None
+        self.added_noise = False
         self.qmc_method = qmc_method
         if self.qmc_method == 'sobol':
             self.sobol_engine = None
         elif self.qmc_method == 'halton':
             self.halton_engine = None
 
-    def forward(self, input, add_noise=False):
+    def forward(self, input, add_noise=False, epsilon_buf=None):
         """
         input: (N, in_channels, H, W)
         logit_output: (N, out_channels, H_, W_)
         """
         logit_output = super().forward(input)
         if add_noise:
+            if epsilon_buf is not None:
+                noise = epsilon_buf * torch.exp(self.log_noise_std[None,:,None,None])
+                self.input_buf = input
+                self.epsilon_buf = epsilon_buf
+                self.added_noise = True
+                return logit_output
+            
             N, out_channels, H_, W_ = logit_output.shape
             epsilon = torch.zeros_like(logit_output, device=self.log_noise_std.device)
 
@@ -187,14 +223,16 @@ class Conv2d(nn.Conv2d):
             else:
                 epsilon[:N//2] += torch.randn((N//2, out_channels, H_, W_), device=self.log_noise_std.device)
             epsilon[N//2:] -= epsilon[:N//2]
+
             noise = epsilon * torch.exp(self.log_noise_std[None,:,None,None])
             self.input_buf = input
             self.epsilon_buf = epsilon
+            self.added_noise = True
             return logit_output + noise
         else:
             return logit_output
 
-    def backward(self, loss):
+    def backward(self, loss, output_grad=None, return_input_grad=False):
         """
         loss: (N,)
         """
@@ -202,10 +240,12 @@ class Conv2d(nn.Conv2d):
         _, C_out, H_out, W_out = self.epsilon_buf.shape
 
         # weight
-        tmp = self.input_buf * loss[:,None,None,None]
-        tmp = tmp.transpose(0,1)
-        epsilon_buf = self.epsilon_buf.transpose(0,1)
-        grad = F.conv2d(tmp,epsilon_buf,torch.zeros(size=(C_out,),device=self.log_noise_std.device),
+        if output_grad is None:
+            output_grad = self.epsilon_buf * loss[:,None,None,None]
+        else:
+            output_grad = (output_grad + self.epsilon_buf * loss[:,None,None,None])/2
+        
+        grad = F.conv2d(self.input_buf.transpose(0,1), output_grad.transpose(0,1), torch.zeros(size=(C_out,), device=self.log_noise_std.device),
                         dilation=self.stride, padding=self.padding)
         if grad.shape[2]>self.weight.shape[2]:
             grad = grad[:,:,:self.weight.shape[2],:]
@@ -214,30 +254,51 @@ class Conv2d(nn.Conv2d):
         self.weight.grad = grad.transpose(0,1) / (N * torch.exp(self.log_noise_std[:,None,None,None]))
 
         # bias
-        tmp = torch.sum(self.epsilon_buf,(2,3)) * loss[:,None]
+        tmp = torch.sum(output_grad,(2,3))
         self.bias.grad = torch.sum(tmp, 0) / (N * torch.exp(self.log_noise_std))
 
+        if return_input_grad:
+            # weight_tmp = self.weight.transpose(0,1).flip([2,3])
+            # padding_tmp = self.kernel_size - 1 - self.padding
+            # input_grad = F.conv2d(self.epsilon_buf* loss[:,None,None,None], weight_tmp, torch.zeros(size=(C_in,), device=self.log_noise_std.device),
+            #                       stride=self.stride, padding=padding_tmp)
+            out_padding_0 = H_in - ((H_out - 1) * self.stride[0] -2 * self.padding[0] + (self.kernel_size[0] - 1) + 1)
+            out_padding_1 = W_in - ((W_out - 1) * self.stride[1] -2 * self.padding[1] + (self.kernel_size[1] - 1) + 1)
+            input_grad = F.conv_transpose2d(self.epsilon_buf* loss[:,None,None,None], self.weight, torch.zeros(size=(C_in,), device=self.log_noise_std.device), 
+                                            self.stride, self.padding, output_padding=(out_padding_0, out_padding_1))
+
         # noise std
-        tmp = torch.sum(self.epsilon_buf**2 - 1, (2,3)) * loss[:,None]
-        self.log_noise_std.grad = torch.sum(tmp, 0) / N
-        # self.log_noise_std.grad = None
+        # tmp = torch.sum(self.epsilon_buf**2 - 1, (2,3)) * loss[:,None]
+        # self.log_noise_std.grad = torch.sum(tmp, 0) / N
+        self.log_noise_std.grad = None
 
         self.input_buf = None
         self.epsilon_buf = None
+        self.added_noise = False
+        if return_input_grad:
+            return input_grad
 
     def fetch_gradient(self):
         return self.weight.grad.detach().cpu()
 
+    def set_sigma(self, new_sigma):
+        assert new_sigma > 0
+        if isinstance(new_sigma, float) or isinstance(new_sigma, int):
+            self.log_noise_std.data = torch.log(torch.full_like(self.log_noise_std.data, new_sigma))
+        elif isinstance(new_sigma, Tensor):
+            assert new_sigma.shape == self.log_noise_std.data.shape
+            self.log_noise_std.data = torch.log(new_sigma)
+
 
 class Conv2d_(nn.Conv2d):
-
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, init_std,
                  bias=True, device=None, dtype=None, qmc_method=None):
         super().__init__(in_channels, out_channels, kernel_size, stride, padding,
                          bias=bias, device=device, dtype=dtype)
         self.log_noise_std = nn.Parameter(torch.full((out_channels,), np.log(init_std), device=device))
-        self.epsilon_buf = None
+        self.epsilon_buf_w = None
         self.epsilon_buf_b = None
+        self.added_noise = False
         self.qmc_method = qmc_method
         if self.qmc_method == 'sobol':
             self.sobol_engine = SobolEngine(2 * (self.weight.data.numel()+self.bias.data.numel()))
@@ -271,7 +332,7 @@ class Conv2d_(nn.Conv2d):
 
             epsilon_w[N * C_out // 2:] -= epsilon_w[:N * C_out // 2]
             epsilon_b[N * C_out // 2:] -= epsilon_b[:N * C_out // 2]
-            self.epsilon_buf = epsilon_w
+            self.epsilon_buf_w = epsilon_w
             self.epsilon_buf_b = epsilon_b
 
             w += epsilon_w * noise_std[:, None, None, None]
@@ -280,6 +341,7 @@ class Conv2d_(nn.Conv2d):
             logit_output = F.conv2d(input.reshape(1,N*C_in,H_in, W_in), w, b, stride=self.stride, padding=self.padding, groups=N)
             _, _, H_out, W_out = logit_output.shape
             logit_output = logit_output.reshape(N,C_out,H_out,W_out)
+            self.added_noise = True
         else:
             logit_output = super().forward(input)
         return logit_output
@@ -287,29 +349,39 @@ class Conv2d_(nn.Conv2d):
     def backward(self, loss):
         N = loss.shape[0]
         # weight
-        tmp_w = torch.stack(torch.split(self.epsilon_buf, split_size_or_sections=self.out_channels, dim=0))    # N, C_out, C_in, H, W
+        tmp_w = torch.stack(torch.split(self.epsilon_buf_w, split_size_or_sections=self.out_channels, dim=0))    # N, C_out, C_in, H, W
+        # tmp_w = self.epsilon_buf_w.unfold(0,self.out_channels, self.out_channels)
         tmp = loss[:,None,None,None,None] * tmp_w
         self.weight.grad = torch.sum(tmp, dim=0) / (N * torch.exp(self.log_noise_std[:,None,None,None]))
 
         # bias
         tmp_b = torch.stack(torch.split(self.epsilon_buf_b, split_size_or_sections=self.out_channels, dim=0))  # N, C_out
+        # tmp_b = self.epsilon_buf_b.unfold(0,self.out_channels, self.out_channels)
         tmp = loss[:, None] * tmp_b
         self.bias.grad = torch.sum(tmp, 0) / (N * torch.exp(self.log_noise_std))
 
         # noise std
         tmp = torch.sum((tmp_w**2) - 1, dim=[2, 3, 4]) + ((tmp_b**2) - 1)
-        self.log_noise_std.grad = torch.sum(tmp * loss[:,None], 0) / N
-        # self.log_noise_std.grad = None
+        # self.log_noise_std.grad = torch.sum(tmp * loss[:,None], 0) / N
+        self.log_noise_std.grad = None
 
-        self.epsilon_buf = None
+        self.epsilon_buf_w = None
         self.epsilon_buf_b = None
+        self.added_noise = False
 
     def fetch_gradient(self):
         return self.weight.grad.detach().cpu()
 
+    def set_sigma(self, new_sigma):
+        assert new_sigma > 0
+        if isinstance(new_sigma, float) or isinstance(new_sigma, int):
+            self.log_noise_std.data = torch.log(torch.full_like(self.log_noise_std.data, new_sigma))
+        elif isinstance(new_sigma, Tensor):
+            assert new_sigma.shape == self.log_noise_std.data.shape
+            self.log_noise_std.data = torch.log(new_sigma)
 
-class BatchNorm2d(nn.BatchNorm2d):
-    
+
+class BatchNorm2d(nn.BatchNorm2d): 
     def __init__(self, num_features, init_std, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True, device=None, dtype=None, qmc_method=None):
         """
         weight: (num_features,)
@@ -322,6 +394,8 @@ class BatchNorm2d(nn.BatchNorm2d):
         self.log_noise_std = nn.Parameter(torch.full((num_features,), np.log(init_std), device=device))
         self.input_buf = None
         self.epsilon_buf = None
+        self.norm_input_buf = None
+        self.added_noise = False
         self.qmc_method = qmc_method
         if self.qmc_method == 'sobol':
             self.sobol_engine = None
@@ -379,11 +453,19 @@ class BatchNorm2d(nn.BatchNorm2d):
             self.eps,
         )
     
-    def forward(self, input, add_noise=False):
-        logit_output = super().forward(input)
-        # logit_output = self.forward_(input, add_noise)
+    def forward(self, input, add_noise=False, epsilon_buf=None):
+        logit_output = super().forward(input) # always update running_mean and running_var if self.training is True
+        # logit_output = self.forward_(input, add_noise) # update running_mean and running_var only when add_noise is True
         
         if add_noise:
+            if epsilon_buf is not None:
+                noise = epsilon_buf * torch.exp(self.log_noise_std[None,:,None,None])
+                self.input_buf = input
+                self.epsilon_buf = epsilon_buf
+                self.norm_input_buf = (input - self.running_mean[None,:,None,None]) / torch.sqrt(self.running_var[None,:,None,None] + self.eps)
+                self.added_noise = True
+                return logit_output
+            
             N, out_channels, H_, W_ = logit_output.shape
             epsilon = torch.zeros_like(logit_output, device=self.log_noise_std.device)
 
@@ -402,6 +484,7 @@ class BatchNorm2d(nn.BatchNorm2d):
             else:
                 epsilon[:N//2] += torch.randn((N//2, out_channels, H_, W_), device=self.log_noise_std.device)
             epsilon[N//2:] -= epsilon[:N//2]
+
             noise = epsilon * torch.exp(self.log_noise_std[None,:,None,None])
             self.input_buf = input
             self.epsilon_buf = epsilon
@@ -417,6 +500,7 @@ class BatchNorm2d(nn.BatchNorm2d):
             #     self.momentum,
             #     self.eps,
             # )
+            self.added_noise = True
             return logit_output + noise
         else:
             return logit_output
@@ -440,23 +524,39 @@ class BatchNorm2d(nn.BatchNorm2d):
 
         # noise std
         tmp = torch.sum(self.epsilon_buf**2 - 1, (2,3)) * loss[:,None]
-        self.log_noise_std.grad = torch.sum(tmp, 0) / N
-        # self.log_noise_std.grad = None
+        # self.log_noise_std.grad = torch.sum(tmp, 0) / N
+        self.log_noise_std.grad = None
 
         self.input_buf = None
         self.epsilon_buf = None
         self.norm_input_buf = None
+        self.added_noise = False
 
     def fetch_gradient(self):
         return self.weight.grad.detach().cpu()
+
+    def set_sigma(self, new_sigma):
+        assert new_sigma > 0
+        if isinstance(new_sigma, float) or isinstance(new_sigma, int):
+            self.log_noise_std.data = torch.log(torch.full_like(self.log_noise_std.data, new_sigma))
+        elif isinstance(new_sigma, Tensor):
+            assert new_sigma.shape == self.log_noise_std.data.shape
+            self.log_noise_std.data = torch.log(new_sigma)
 
 
 class Sequential(nn.Sequential):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def forward(self, input, add_noise=False):
-        for module in self:
+    def forward(self, input, add_noise=False, epsilon_buf=None):
+        length = len(self)
+        for i, module in enumerate(self):
+            if (add_noise is True) and (epsilon_buf is not None) and (i == length - 1):
+                try:
+                    input = module(input, add_noise, epsilon_buf)
+                    continue
+                except TypeError:
+                    pass
             try:
                 input = module(input, add_noise)
             except TypeError:
@@ -466,7 +566,7 @@ class Sequential(nn.Sequential):
     def backward(self, loss):
         for module in self:
             try:
-                if module.epsilon_buf is not None:
+                if module.added_noise:
                     module.backward(loss)
             except AttributeError:
                 continue
@@ -482,10 +582,16 @@ class Sequential(nn.Sequential):
             return gradient_list[0]
         else:
             return gradient_list
+
+    def set_sigma(self, new_sigma):
+        for module in self:
+            try:
+                module.set_sigma(new_sigma)
+            except AttributeError:
+                continue
         
         
 class BasicBlock(nn.Module):
-    
     def __init__(self, conv, in_channels, out_channels, kernel_size, ds_size, init_std,
                  bias=True, device=None, dtype=None, qmc_method=None, if_residual=True, norm_layer=None):
         super().__init__()
@@ -509,11 +615,11 @@ class BasicBlock(nn.Module):
             else:
                 self.input_connect = Sequential(nn.Identity())
         
-        self.epsilon_buf = None
+        self.added_noise = False
 
     def forward(self, input, add_noise=False):
         if add_noise:
-            self.epsilon_buf = 1
+            self.added_noise = True
 
         x = input
 
@@ -525,24 +631,28 @@ class BasicBlock(nn.Module):
         x = self.bn2(x,add_noise)
 
         if self.if_residual:
-            x += self.input_connect(input, add_noise)
+            try:
+                bn2_epsilon_buf = self.bn2.epsilon_buf # not None if add_noise else None
+                x += self.input_connect(input, add_noise, bn2_epsilon_buf)
+            except (AttributeError, TypeError):
+                x += self.input_connect(input, add_noise)
 
         x = self.relu(x)
 
         return x
 
     def backward(self, loss):
-        if self.conv1.epsilon_buf is not None:
-                self.conv1.backward(loss)
-        if self.bn1.epsilon_buf is not None:
-                self.bn1.backward(loss)
-        if self.conv2.epsilon_buf is not None:
-                self.conv2.backward(loss)
-        if self.bn2.epsilon_buf is not None:
-                self.bn2.backward(loss)
+        if self.conv1.added_noise:
+            self.conv1.backward(loss)
+        if self.bn1.added_noise:
+            self.bn1.backward(loss)
+        if self.conv2.added_noise:
+            self.conv2.backward(loss)
+        if self.bn2.added_noise:
+            self.bn2.backward(loss)
         if self.if_residual:
             self.input_connect.backward(loss)
-        self.epsilon_buf = None
+        self.added_noise = False
     
     def fetch_gradient(self):
         gradient_list = []
@@ -555,10 +665,16 @@ class BasicBlock(nn.Module):
             return gradient_list[0]
         else:
             return gradient_list
-        
-        
-class BasicBlock_wo_BN(nn.Module):
     
+    def set_sigma(self, new_sigma):
+        self.conv1.set_sigma(new_sigma)
+        self.bn1.set_sigma(new_sigma)
+        self.conv2.set_sigma(new_sigma)
+        self.bn2.set_sigma(new_sigma)
+        self.input_connect.set_sigma(new_sigma)
+
+       
+class BasicBlock_wo_BN(nn.Module):  
     def __init__(self, conv, in_channels, out_channels, kernel_size, ds_size, init_std,
                  bias=True, device=None, dtype=None, qmc_method=None, if_residual=True, norm_layer=None):
         super().__init__()
@@ -581,11 +697,11 @@ class BasicBlock_wo_BN(nn.Module):
             else:
                 self.input_connect = Sequential(nn.Identity())
         
-        self.epsilon_buf = None
+        self.added_noise = False
 
     def forward(self, input, add_noise=False):
         if add_noise:
-            self.epsilon_buf = 1
+            self.added_noise = True
         x = input
 
         x = self.conv1(x,add_noise)
@@ -596,24 +712,27 @@ class BasicBlock_wo_BN(nn.Module):
         # x = self.bn2(x,add_noise)
 
         if self.if_residual:
-            x += self.input_connect(input, add_noise)
+            try:
+                conv2_epsilon_buf = self.conv2.epsilon_buf # not None if add_noise else None
+                x += self.input_connect(input, add_noise, conv2_epsilon_buf)
+            except (AttributeError, TypeError):
+                x += self.input_connect(input, add_noise)
 
         x = self.relu(x)
 
         return x
 
     def backward(self, loss):
-        if self.conv1.epsilon_buf is not None:
-                self.conv1.backward(loss)
-        # if self.bn1.epsilon_buf is not None:
-        #         self.bn1.backward(loss)
-        if self.conv2.epsilon_buf is not None:
-                self.conv2.backward(loss)
-        # if self.bn2.epsilon_buf is not None:
-        #         self.bn2.backward(loss)
         if self.if_residual:
             self.input_connect.backward(loss)
-        self.epsilon_buf = None
+        if self.conv2.added_noise:
+            relu_sign = (self.conv2.input_buf > 0).float()
+            conv2_input_grad = self.conv2.backward(loss, return_input_grad=True)
+            conv1_output_grad = conv2_input_grad * relu_sign
+        if self.conv1.added_noise:
+            self.conv1.backward(loss, conv1_output_grad)
+            
+        self.added_noise = False
     
     def fetch_gradient(self):
         gradient_list = []
@@ -626,5 +745,11 @@ class BasicBlock_wo_BN(nn.Module):
             return gradient_list[0]
         else:
             return gradient_list
-        
+    
+    def set_sigma(self, new_sigma):
+        self.conv1.set_sigma(new_sigma)
+        # self.bn1.set_sigma(new_sigma)
+        self.conv2.set_sigma(new_sigma)
+        # self.bn2.set_sigma(new_sigma)
+        self.input_connect.set_sigma(new_sigma)
     
