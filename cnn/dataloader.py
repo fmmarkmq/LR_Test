@@ -32,7 +32,6 @@ def get_grey_valid_loader(data_dir, batch_size):
     testloader = torch.utils.data.DataLoader(valid_set, batch_size=batch_size, shuffle=False)
     return testloader
 
-
 def get_mask_valid_loader(data_dir, batch_size):
     cifar_norm_mean = (0.49139968, 0.48215827, 0.44653124)
     cifar_norm_std = (0.24703233, 0.24348505, 0.26158768)
